@@ -14562,13 +14562,41 @@ function Invoke-RamBench {
     }
 }
 
+function Get-BenchProgress {
+    # Reine Rechnung fuer die Anzeige: Schreiben belegt die erste, Lesen die
+    # zweite Haelfte des Balkens. Als eigene Funktion, weil sich eine
+    # verrutschte Prozentzahl sonst nur von Hand feststellen laesst.
+    param([int]$Done, [int]$Total, [string]$Phase = 'write')
+    if ($Total -le 0) { return 0 }
+    $f = [double]$Done / [double]$Total
+    if ($f -lt 0) { $f = 0.0 }
+    if ($f -gt 1) { $f = 1.0 }
+    $base = if ($Phase -eq 'read') { 50.0 } else { 0.0 }
+    return [int]($base + ($f * 50.0))
+}
+
+function Remove-BenchLeftover {
+    # Bricht ein Lauf hart ab - abgewuergtes Programm, Stromausfall - bleibt
+    # eine 64-MB-Datei liegen. Vor jedem Lauf einmal nachsehen.
+    param([string]$Path)
+    try {
+        if ($Path -and (Test-Path -LiteralPath $Path)) {
+            Remove-Item -LiteralPath $Path -Force -ErrorAction SilentlyContinue
+            return $true
+        }
+    }
+    catch { }
+    return $false
+}
+
 function Invoke-DiskBench {
     # FILE_FLAG_NO_BUFFERING (0x20000000) umgeht den Dateisystem-Cache.
     # Ohne ihn las der Test die eben geschriebenen Daten aus dem
     # Arbeitsspeicher zurueck und meldete auf jeder Platte Gigabytewerte.
-    param([int]$SizeMB = 64)
+    param([int]$SizeMB = 64, [int]$TickEvery = 8)
     $file = Get-BenchFilePath
-    $res = @{ Write = 0.0; Read = 0.0; Cached = $false; Path = $file; Unit = 'MB/s'; Space = $true }
+    $res = @{ Write = 0.0; Read = 0.0; Cached = $false; Path = $file; Unit = 'MB/s'; Space = $true; Cancelled = $false }
+    [void](Remove-BenchLeftover -Path $file)
     if (-not (Test-BenchDiskSpace -Path $file -NeedMB $SizeMB)) {
         $res.Space = $false
         return $res
@@ -14587,19 +14615,45 @@ function Invoke-DiskBench {
                 Update-BusyOverlay -Status (Get-Text 'BenchWrite') -Percent 30
                 $fs = New-Object System.IO.FileStream($file, [System.IO.FileMode]::Create, [System.IO.FileAccess]::Write, [System.IO.FileShare]::None, $chunk, $opts)
                 $sw = [System.Diagnostics.Stopwatch]::StartNew()
-                for ($i = 0; $i -lt $SizeMB; $i++) { $fs.Write($buf, 0, $chunk) }
+                # 64 Megabyte am Stueck sind auf einer Festplatte oder einem
+                # USB-Stick zehn Sekunden und mehr. Ohne Durchreichen stand
+                # das Fenster still und der Abbruchknopf war wirkungslos.
+                # Die Uhr wird fuer das Durchreichen angehalten, sonst misst
+                # der Test die eigene Anzeige mit.
+                for ($i = 0; $i -lt $SizeMB; $i++) {
+                    $fs.Write($buf, 0, $chunk)
+                    if (($i + 1) % $TickEvery -eq 0) {
+                        $sw.Stop()
+                        $stop = Invoke-BusyTick -Status (Get-Text 'BenchWrite') `
+                            -Percent (Get-BenchProgress -Done ($i + 1) -Total $SizeMB -Phase 'write')
+                        $sw.Start()
+                        if ($stop) { $res.Cancelled = $true; break }
+                    }
+                }
                 $fs.Flush($true)
                 $fs.Dispose()
                 $sw.Stop()
+                if ($res.Cancelled) { break }
                 $res.Write = $SizeMB / [math]::Max($sw.Elapsed.TotalSeconds, 0.000001)
 
                 Update-BusyOverlay -Status (Get-Text 'BenchRead') -Percent 70
                 $ropts = if ($pass -eq 'nobuffer') { [System.IO.FileOptions]$noBuf } else { [System.IO.FileOptions]::SequentialScan }
                 $fr = New-Object System.IO.FileStream($file, [System.IO.FileMode]::Open, [System.IO.FileAccess]::Read, [System.IO.FileShare]::None, $chunk, $ropts)
                 $sw2 = [System.Diagnostics.Stopwatch]::StartNew()
-                while ($fr.Read($buf, 0, $chunk) -gt 0) { }
+                $n = 0
+                while ($fr.Read($buf, 0, $chunk) -gt 0) {
+                    $n++
+                    if ($n % $TickEvery -eq 0) {
+                        $sw2.Stop()
+                        $stop = Invoke-BusyTick -Status (Get-Text 'BenchRead') `
+                            -Percent (Get-BenchProgress -Done $n -Total $SizeMB -Phase 'read')
+                        $sw2.Start()
+                        if ($stop) { $res.Cancelled = $true; break }
+                    }
+                }
                 $fr.Dispose()
                 $sw2.Stop()
+                if ($res.Cancelled) { break }
                 $res.Read = $SizeMB / [math]::Max($sw2.Elapsed.TotalSeconds, 0.000001)
                 $res.Cached = ($pass -ne 'nobuffer')
                 break
@@ -14754,6 +14808,11 @@ function Invoke-Benchmark {
             $d = Invoke-DiskBench
             if (-not $d.Space) {
                 Write-BenchLine (Get-Text 'BenchNoSpace') $script:Theme.Error
+            }
+            elseif ($d.Cancelled) {
+                # Eine halb geschriebene Datei ergibt keine Rate - lieber
+                # keinen Wert als einen erfundenen.
+                Write-BenchLine (Get-Text 'BusyCancelled') $script:Theme.Warning
             }
             else {
                 $res.Write = [double]$d.Write
