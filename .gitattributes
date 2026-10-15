@@ -1,0 +1,5 @@
+# Zeilenenden nicht anfassen: die .cmd traegt Batch-Header + PowerShell-Nutzlast
+# in einer Datei. Wandelt Git die CRLF um, zerbricht der Starter.
+*.cmd -text diff
+*.ps1 text eol=crlf
+*.md text eol=lf
