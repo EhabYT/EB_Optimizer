@@ -2652,6 +2652,7 @@ $script:ExtraStrings = @{
         RepDismError   = 'DISM meldet einen Fehler'
         RepChkSched    = 'Pruefung wird beim naechsten Neustart ausgefuehrt'
         RepChkFixed    = 'Fehler gefunden und behoben'
+        RepChkWarn     = 'Die Pruefung laeuft erst beim naechsten Neustart und kann je nach Datentraeger Stunden dauern.'
         RepNoLog       = 'Ergebnisprotokoll nicht lesbar'
         SingleTitle    = 'Bereits geoeffnet'
         SingleMsg      = 'EB_Optimizer laeuft bereits. Das vorhandene Fenster wird in den Vordergrund geholt.'
@@ -3058,6 +3059,7 @@ $script:ExtraStrings = @{
         RepDismError   = 'DISM reported an error'
         RepChkSched    = 'The check will run on the next restart'
         RepChkFixed    = 'Errors found and fixed'
+        RepChkWarn     = 'The check only runs at the next restart and can take hours depending on the drive.'
         RepNoLog       = 'Result log could not be read'
         SingleTitle    = 'Already running'
         SingleMsg      = 'EB_Optimizer is already running. The existing window is brought to the front.'
@@ -3464,6 +3466,7 @@ $script:ExtraStrings = @{
         RepDismError   = 'DISM bir hata bildirdi'
         RepChkSched    = 'Denetim bir sonraki yeniden baslatmada calisacak'
         RepChkFixed    = 'Hatalar bulundu ve giderildi'
+        RepChkWarn     = 'Denetim ancak bir sonraki yeniden baslatmada calisir ve surucuye gore saatler surebilir.'
         RepNoLog       = 'Sonuc gunlugu okunamadi'
         SingleTitle    = 'Zaten calisiyor'
         SingleMsg      = 'EB_Optimizer zaten calisiyor. Mevcut pencere one getiriliyor.'
@@ -3870,6 +3873,7 @@ $script:ExtraStrings = @{
         RepDismError   = 'أبلغ DISM عن خطأ'
         RepChkSched    = 'سيتم إجراء الفحص عند إعادة التشغيل التالية'
         RepChkFixed    = 'تم العثور على أخطاء وإصلاحها'
+        RepChkWarn     = 'يبدأ الفحص عند إعادة التشغيل التالية وقد يستغرق ساعات حسب القرص.'
         RepNoLog       = 'تعذرت قراءة سجل النتائج'
         SingleTitle    = 'قيد التشغيل بالفعل'
         SingleMsg      = 'EB_Optimizer قيد التشغيل بالفعل. سيتم إحضار النافذة الحالية إلى المقدمة.'
@@ -15233,6 +15237,66 @@ function Get-FileTail {
     return $out
 }
 
+function Get-ChkdskDrivesFromBootExecute {
+    # Windows merkt sich eine eingeplante Datentraegerpruefung in
+    # BootExecute: 'autocheck autochk /r \??\C:'. Reine Auswertung, damit
+    # sich der Sonderfall ohne Registrierung pruefen laesst.
+    param($Lines)
+    $out = New-Object System.Collections.ArrayList
+    foreach ($l in @($Lines)) {
+        if (-not $l) { continue }
+        foreach ($m in [regex]::Matches([string]$l, '(?i)\\\?\?\\([A-Za-z]):')) {
+            $d = $m.Groups[1].Value.ToUpperInvariant() + ':'
+            if (-not $out.Contains($d)) { [void]$out.Add($d) }
+        }
+    }
+    return @($out.ToArray())
+}
+
+function Test-ChkdskScheduled {
+    # Fragt die Registrierung, ob fuer dieses Laufwerk wirklich eine Pruefung
+    # eingeplant ist. Der Beendigungscode von chkdsk sagt das nicht: er ist
+    # auch dann 0, wenn die Pruefung nur vorgemerkt wurde.
+    param([string]$Drive = $env:SystemDrive)
+    $v = Get-RegistryValueFast -Path 'HKLM:\SYSTEM\CurrentControlSet\Control\Session Manager' -Name 'BootExecute'
+    if (-not $v) { return $false }
+    $drives = @(Get-ChkdskDrivesFromBootExecute -Lines @($v))
+    return ($drives -contains ([string]$Drive).ToUpperInvariant())
+}
+
+function Restart-Explorer {
+    # Zwei Ansichten starteten den Explorer bisher mit eigenem, leicht
+    # unterschiedlichem Code neu. Wichtiger noch: nach dem Beenden startet
+    # Windows die Oberflaeche selbst wieder. Wer sofort nachhilft, startet
+    # den Explorer aus einem Prozess mit erhoehten Rechten - und damit laeuft
+    # der ganze Desktop als Administrator. Deshalb wird gewartet und nur im
+    # Notfall von Hand gestartet.
+    $ok = $false
+    Show-BusyOverlay -Title (Get-Text 'RepairExplorer') -Status 'explorer.exe'
+    try {
+        Stop-Process -Name explorer -Force -ErrorAction SilentlyContinue
+        $sw = [System.Diagnostics.Stopwatch]::StartNew()
+        while ($sw.Elapsed.TotalSeconds -lt 6) {
+            Wait-AppDelay -Ms 250
+            if (@(Get-Process -Name explorer -ErrorAction SilentlyContinue).Count -gt 0) { $ok = $true; break }
+            Update-BusyOverlay -Status ('explorer.exe  ·  {0:0.0}s' -f $sw.Elapsed.TotalSeconds) -Percent -1
+        }
+        $sw.Stop()
+        if (-not $ok) {
+            try {
+                Start-Process explorer.exe
+                Wait-AppDelay -Ms 800
+                $ok = (@(Get-Process -Name explorer -ErrorAction SilentlyContinue).Count -gt 0)
+            }
+            catch { Write-Log "$(Get-Text 'Error'): $($_.Exception.Message)" 'ERROR' }
+        }
+        if ($ok) { Write-Log "$(Get-Text 'RepairExplorer'): $(Get-Text 'Success')" 'SUCCESS' }
+        else { Write-Log "$(Get-Text 'RepairExplorer'): $(Get-Text 'Error')" 'ERROR' }
+    }
+    finally { Hide-BusyOverlay }
+    return $ok
+}
+
 function Get-RepairResult {
     # Macht aus dem Protokoll des Werkzeugs eine Klartext-Aussage. Der
     # Beendigungscode allein taugt dafuer nicht: sfc.exe liefert auch dann 0,
@@ -15240,7 +15304,8 @@ function Get-RepairResult {
     param(
         [ValidateSet('SFC', 'DISM', 'CHKDSK')][string]$Kind,
         $ExitCode = $null,
-        [string[]]$Lines = @()
+        [string[]]$Lines = @(),
+        [switch]$Scheduled
     )
     $joined = ''
     if ($Lines -and $Lines.Count -gt 0) { $joined = ($Lines -join "`n") }
@@ -15270,7 +15335,12 @@ function Get-RepairResult {
             return @{ Level = 'SUCCESS'; Key = 'RepDismOk' }
         }
         default {
-            # chkdsk: 0 sauber, 1 Fehler behoben, 2/3 Pruefung steht aus
+            # chkdsk: 0 sauber, 1 Fehler behoben, 2/3 Pruefung steht aus.
+            # Der haeufigste Fall auf dem Systemlaufwerk ist aber: chkdsk
+            # kann die Partition nicht sperren, merkt die Pruefung fuer den
+            # naechsten Start vor - und beendet sich trotzdem mit 0. Wer nur
+            # den Code liest, meldet faelschlich "keine Fehler gefunden".
+            if ($Scheduled) { return @{ Level = 'WARNING'; Key = 'RepChkSched' } }
             $c = if ($null -eq $ExitCode) { 0 } else { [int]$ExitCode }
             if ($c -eq 1) { return @{ Level = 'WARNING'; Key = 'RepChkFixed' } }
             if ($c -ge 2) { return @{ Level = 'WARNING'; Key = 'RepChkSched' } }
@@ -15299,8 +15369,15 @@ function Write-RepairResult {
         }
         # SFC und DISM hinterlassen regelmaessig einen ausstehenden Neustart.
         $script:RebootStateTime = $null
-        $res = Get-RepairResult -Kind $Kind -ExitCode $ExitCode -Lines $lines
+        # Nachsehen statt dem Beendigungscode glauben.
+        $sched = $false
+        if ($Kind -eq 'CHKDSK') { $sched = Test-ChkdskScheduled }
+        $res = Get-RepairResult -Kind $Kind -ExitCode $ExitCode -Lines $lines -Scheduled:$sched
         if (-not $res) { return }
+        # Ein eingeplanter Datentraegertest und DISM mit 3010 brauchen beide
+        # einen Neustart - der Hinweis gehoert in die Kopfzeile, nicht nur
+        # einmalig ins Protokoll.
+        if ($res.Key -in @('RepChkSched', 'RepDismReboot')) { Set-RebootHint }
         $txt = Get-Text $res.Key
         if ($res.Detail) { $txt = "$txt ($($res.Detail))" }
         if ($Label) { $txt = "$Label : $txt" }
@@ -15375,9 +15452,14 @@ function Show-RepairCenter {
     } | Out-Null
 
     Add-Card -TitleKey 'RepairCHKDSK' -DescKey 'RepairCHKDSKDesc' -BtnKey 'Start' -Icon 'disc' -X 605 -Y 95 -Color $script:Theme.Warning -Action {
-        if (-not (Show-Confirm -Message (Get-Text 'DlgConfirm'))) { return }
-        if (Invoke-RepairCommand -File 'cmd.exe' -Arguments "/c echo Y| chkdsk $env:SystemDrive /f /r" -Label 'CHKDSK' -ResultKind 'CHKDSK') {
-            Write-Log "$(Get-Text 'DlgRestartReq')" 'WARNING'
+        # Vorher sagen, worauf man sich einlaesst: auf dem Systemlaufwerk
+        # laeuft die Pruefung erst beim naechsten Start und kann Stunden
+        # dauern - in dieser Zeit ist der Rechner nicht benutzbar.
+        if (-not (Show-Confirm -Message "$(Get-Text 'RepairCHKDSK') ($env:SystemDrive)?`n`n$(Get-Text 'RepChkWarn')")) { return }
+        [void](Invoke-RepairCommand -File 'cmd.exe' -Arguments "/c echo Y| chkdsk $env:SystemDrive /f /r" -Label 'CHKDSK' -ResultKind 'CHKDSK')
+        # Nicht der Beendigungscode entscheidet, sondern ob die Pruefung
+        # tatsaechlich in der Registrierung vorgemerkt ist.
+        if (Test-ChkdskScheduled) {
             [void](Show-Info -Title (Get-Text 'RepairCHKDSK') -Message (Get-Text 'ChkdskScheduled'))
         }
     } | Out-Null
@@ -15393,17 +15475,7 @@ function Show-RepairCenter {
     } | Out-Null
 
     Add-Card -TitleKey 'RepairExplorer' -DescKey 'RepairExplorerDesc' -BtnKey 'Restart' -Icon 'folders' -X 25 -Y 265 -Color $script:Theme.Success -Action {
-        Show-BusyOverlay -Title (Get-Text 'RepairExplorer') -Status 'explorer.exe'
-        try {
-            Stop-Process -Name explorer -Force -ErrorAction SilentlyContinue
-            Wait-AppDelay -Ms 800
-            if (-not (Get-Process -Name explorer -ErrorAction SilentlyContinue)) {
-                Start-Process explorer.exe
-            }
-            Write-Log "$(Get-Text 'RepairExplorer'): $(Get-Text 'Success')" 'SUCCESS'
-        }
-        catch { Write-Log "$(Get-Text 'Error'): $($_.Exception.Message)" 'ERROR' }
-        finally { Hide-BusyOverlay }
+        [void](Restart-Explorer)
     } | Out-Null
 
     Add-Card -TitleKey 'RepairWU' -DescKey 'RepairWUDesc' -BtnKey 'Reset' -Icon 'refresh' -X 315 -Y 265 -Color $script:Theme.Accent -Action {
@@ -15462,15 +15534,7 @@ function Show-ContextMenu {
     } | Out-Null
 
     Add-Card -TitleKey 'RepairExplorer' -DescKey 'RepairExplorerDesc' -BtnKey 'Restart' -Icon 'refresh' -X 895 -Y 95 -Color $script:Theme.Success -Action {
-        Show-BusyOverlay -Title (Get-Text 'RepairExplorer') -Status 'explorer.exe'
-        try {
-            Stop-Process -Name explorer -Force -ErrorAction SilentlyContinue
-            Wait-AppDelay -Ms 800
-            if (-not (Get-Process -Name explorer -ErrorAction SilentlyContinue)) { Start-Process explorer.exe }
-            Write-Log "$(Get-Text 'RepairExplorer'): $(Get-Text 'Success')" 'SUCCESS'
-        }
-        catch { Write-Log "$(Get-Text 'Error'): $($_.Exception.Message)" 'ERROR' }
-        finally { Hide-BusyOverlay }
+        [void](Restart-Explorer)
     } | Out-Null
 }
 
